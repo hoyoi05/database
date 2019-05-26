@@ -349,7 +349,7 @@ class MSSQLRecovery():
             return False
 
         for tableinfo in self.tablelist:
-            tobjectid = tableinfo.t_objectID
+            tobjectid = tableinfo.tobjectid
             isFindId = False
 
             for k, v in sysrowsets_page.items():
@@ -370,6 +370,10 @@ class MSSQLRecovery():
                     if self._parseObjectInfoRecord(buf[offset:], length - offset, sysrowsets_schemes, rowinfo, tobjectid, partitionId) == True:
                         tableinfo.partitionid = partitionId
 
+                        if (self._searchSysallocunits(tableinfo)):
+                            isFindId = True
+                            break
+
                 del buf
         
         return True
@@ -378,7 +382,7 @@ class MSSQLRecovery():
         print('Recovery MSSQL')
 
         for tableinfo in self.tablelist:
-            table_scheme = self.userschemesmap[tableinfo.t_objectID]
+            table_scheme = self.userschemesmap[tableinfo.tobjectid]
             table_scheme = sorted(table_scheme, key=lambda SchemeInfo: SchemeInfo.colorder)
             
             rowinfo = RowInfo()
@@ -400,7 +404,7 @@ class MSSQLRecovery():
                     if schema.ismax:
                         print(schema.colname + ' ' + schema.datatype)
                     else:
-                        print(schema.colname + ' ' + schema.datatype + ' ' + schema.colsize)
+                        print(schema.colname + ' ' + schema.datatype + ' ' + str(schema.colsize))
                 else:
                     print(schema.colname + ' ' + schema.datatype)
 
@@ -766,14 +770,14 @@ class MSSQLRecovery():
             elif schema.colname == 'idmajor':
                 tboId = unpack('<I', columnbuff[:4])[0]
             
-            del columnbuff
+            #del columnbuff
         
         if (partitionid == 0) or (tboId != objectid):
             return False
         else:
             return True
 
-    def _searchSysallocunits(self, tableinfo, pagemap, schemlist):
+    def _searchSysallocunits(self, tableinfo):
         sysallocunits_page = defaultdict(list, {k: v for k, v in self.pages.items() if v == 0x07})
         sysallocunits_schemes = self.systemschemesmap[0x07]
         sysallocunits_schemes = sorted(sysallocunits_schemes, key=lambda SchemeInfo: SchemeInfo.colorder)
@@ -803,7 +807,7 @@ class MSSQLRecovery():
                 allocationid = 0
                 if self._parseAllocUnitInfoRecord(buf[offset:], length - offset, sysallocunits_schemes, rowinfo, tableinfo, allocationid) == True:
                     # indexid = allocationid >> 48
-                    tableinfo.pobjecid = ((allocationid) - ((allocationid >> 48) << 48)) >> 16
+                    tableinfo.pobjectid = ((allocationid) - ((allocationid >> 48) << 48)) >> 16
 
         return True
                 

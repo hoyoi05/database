@@ -366,10 +366,8 @@ class MSSQLRecovery():
 
                 recordlen = rowoffsetarray[1:] + [self.mssql.pagesize - len(rowoffsetarray) * 2]
                 for offset, length in zip(rowoffsetarray, recordlen):
-                    partitionId = 0
-                    if self._parseObjectInfoRecord(buf[offset:], length - offset, sysrowsets_schemes, rowinfo, tobjectid, partitionId) == True:
-                        tableinfo.partitionid = partitionId
-
+                    tableinfo.partitionid = self._parseObjectInfoRecord(buf[offset:], length - offset, sysrowsets_schemes, rowinfo, tobjectid)
+                    if tableinfo.partitionid != 0:
                         if (self._searchSysallocunits(tableinfo)):
                             isFindId = True
                             break
@@ -414,7 +412,7 @@ class MSSQLRecovery():
             for k, v in table_page.items():
                 buf = self.mssql.read(k * self.mssql.pagesize, self.mssql.pagesize)
                 pageheader = self.mssql.getPageHeader(buf)
-                if pageheader.type == 0x01:
+                if pageheader.type != 0x01:
                     continue
 
                 if pageheader.flagbits & 0x100:
@@ -438,6 +436,10 @@ class MSSQLRecovery():
 
                 if isAllUnallocSpace:
                     self._scanForUnallocatedArea(buf, currentOffset, 0x2000 - currentOffset, rowinfo, tableinfo.tablename, table_scheme)
+                else:
+                    for i, offset in enumerate(rowoffsetarray):
+                        recordLen = self._calcRecordLen(buf[offset:], rowinfo)
+                        print("hello")
 
     def _getTypeName(self, xtype, utype):
         if xtype == 0x7F:
@@ -710,10 +712,11 @@ class MSSQLRecovery():
             if (schema.colorder < tmpOrdinal) and (schema.colData > indexcolumnid):
                 schema.colorder += 1
 
-    def _parseObjectInfoRecord(self, buf, recordlen, schemlist, rowinfo, objectid, partitionid):
+    def _parseObjectInfoRecord(self, buf, recordlen, schemlist, rowinfo, objectid):
         lenofnullbitmap = math.ceil(rowinfo.numoftotalcol/8)
         offsetoftotalnumofcol = unpack('<H', buf[0x02 : 0x04])[0]
         totalnumofcol = unpack('<H', buf[offsetoftotalnumofcol:offsetoftotalnumofcol + 0x02])[0]
+        partitionid = 0
 
         if rowinfo.numoftotalcol != totalnumofcol:
             return False
@@ -769,13 +772,15 @@ class MSSQLRecovery():
                 partitionid = unpack('<Q', columnbuff[:8])[0]
             elif schema.colname == 'idmajor':
                 tboId = unpack('<I', columnbuff[:4])[0]
+                if tboId == 2105058535:
+                    print("Hohoho")
             
             #del columnbuff
         
         if (partitionid == 0) or (tboId != objectid):
-            return False
+            return 0
         else:
-            return True
+            return partitionid
 
     def _searchSysallocunits(self, tableinfo):
         sysallocunits_page = defaultdict(list, {k: v for k, v in self.pages.items() if v == 0x07})
@@ -804,18 +809,18 @@ class MSSQLRecovery():
 
             recordlen = rowoffsetarray[1:] + [self.mssql.pagesize - len(rowoffsetarray) * 2]
             for offset, length in zip(rowoffsetarray, recordlen):
-                allocationid = 0
-                if self._parseAllocUnitInfoRecord(buf[offset:], length - offset, sysallocunits_schemes, rowinfo, tableinfo, allocationid) == True:
-                    # indexid = allocationid >> 48
+                allocationid = self._parseAllocUnitInfoRecord(buf[offset:], length - offset, sysallocunits_schemes, rowinfo, tableinfo)
+                if allocationid != 0:
                     tableinfo.pobjectid = ((allocationid) - ((allocationid >> 48) << 48)) >> 16
 
         return True
                 
 
-    def _parseAllocUnitInfoRecord(self, buf, recordlen, schemlist, rowinfo, tableinfo, allocationid):
+    def _parseAllocUnitInfoRecord(self, buf, recordlen, schemlist, rowinfo, tableinfo):
         lenofnullbitmap = math.ceil(rowinfo.numoftotalcol/8)
         offsetoftotalnumofcol = unpack('<H', buf[0x02 : 0x04])[0]
         totalnumofcol = unpack('<H', buf[offsetoftotalnumofcol:offsetoftotalnumofcol + 0x02])[0]
+        allocationid = 0
 
         if rowinfo.numoftotalcol != totalnumofcol:
             return False
@@ -877,9 +882,9 @@ class MSSQLRecovery():
             del columnbuff
         
         if (pid == 0) or (pid != tableinfo.partitionid) or (flag != 0x01):
-            return False
+            return 0
         else:
-            return True
+            return allocationid
     
     def _tornbits(self, buf):
         tornbit = unpack('<I', buf[0x3c:0x40])[0]
@@ -894,32 +899,36 @@ class MSSQLRecovery():
             buf[offset] = buf[offset] | changeData
             tornbit = tornbit >> 2
             offset += 0x200
+
+    def _calcRecordLen(self, buf, rowinfo):
+        offsetOftotalNumOfCol = unpack('<H', buf[0x2:0x4])[0]
+
+        totalNumOfCol = unpack('<H', buf[offsetOftotalNumOfCol:offsetOftotalNumOfCol + 2])[0]
+
+        if totalNumOfCol != rowinfo.numoftotalcol:
+            return 0
+
+        if (rowinfo.numoftotalcol % 8 == 0) and (rowinfo.numoftotalcol != 0):
+            lenOfNullBitmap = (int)(rowinfo.numoftotalcol / 8)
+        else:
+            lenOfNullBitmap = (int)(rowinfo.numoftotalcol / 8) + 1
+
+        recordLen = 0
+
+        recordLen += 4 # StatusBit A(1 byte) + StatusBit B(1 byte) + Offset of number of column(2 bytes)
+        recordLen += rowinfo.staticlength # Static column length
+        recordLen += (2 + lenOfNullBitmap)
+
+        if (rowinfo.numofvariablecol == 0 or buf[0] == 0x10 or buf[0] == 0x1c):
+            return recordLen
+        else:
+            numOfVariableCol = unpack('<H', buf[recordLen:recordLen + 2])[0]
+            recordLen = unpack('<H', buf[recordLen + numOfVariableCol * 2:recordLen + (numOfVariableCol + 1) * 2])[0]
+            if recordLen > 0x8000:
+                recordLen -= 0x8000
+
+            return recordLen
                 
     def _scanForUnallocatedArea(self, buf, currentoffset, lenofunalloc, rowinfo, tablename, schemlist):
         if currentoffset + lenofunalloc > self.mssql.pagesize:
             return False
-
-        
-
-
-def main():
-    print('MSSQL Record Recovery Tool (version 1.0)')
-    mssql_class = MSSQL()
-    mssql_class.open(sys.argv[1])
-    mssql_class.read(0, 512)
-    mssql_recovery = MSSQLRecovery(mssql_class)
-    #### Meta data parsing
-    mssql_recovery.scanPages()
-    mssql_recovery.getSystemTableColumnInfo()
-    if mssql_recovery.getTableInfo() != True:
-        sys.exit()
-    mssql_recovery.getColumnInfo()
-    mssql_recovery.getKeyColumnInfo()
-    mssql_recovery.getPageObjectId()
-
-    #### Recovery
-    mssql_recovery.recovery()
-
-if __name__ == "__main__":
-    main()
-

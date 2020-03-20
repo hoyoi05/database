@@ -11,7 +11,7 @@
             "program": "${file}",
             "console": "integratedTerminal",
             "args": [
-                "sample\\AccountBook.mdf"
+                "sample\\Test.mdf"
             ]
         }
     ]

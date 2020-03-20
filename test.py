@@ -16,7 +16,7 @@ def main():
         sys.exit()
     mssql_recovery.getColumnInfo()
     mssql_recovery.getKeyColumnInfo()
-    mssql_recovery.getPageObjectId() ## 이 부분 오류
+    mssql_recovery.getPageObjectId() ## 이 부분 오류 -> 수정 완료
 
     #### Recovery
     mssql_recovery.recovery()

@@ -3,6 +3,7 @@ import os
 import argparse
 import enum
 import math
+import binascii
 
 from ctypes import *
 from struct import *
@@ -78,13 +79,18 @@ class TableInfo:
     pobjectid: int = 0
     partitionid: int = 0
 
+
+@dataclass(order=True, frozen=True)
+class RowId:
+    fileId: int = None
+    pageId: int = None
+    slotNumber: int = None
+
 @dataclass(order=True)
 class LobInfo:
-    length: int = 0
-    pageId: int = 0
-    fileId: int = 0
-    slotNumber: int = 0
-    timestamp: bytes = b''
+    timestamp: int = None
+    link: set = ()
+
 
 class MSSQL():
     def __init__(self):
@@ -120,7 +126,7 @@ class MSSQL():
 
     def getRowOffsetArray(self, buf, pageheader):
         fmt = '<' + str(pageheader.slotcnt) + 'H'
-        rowoffsetarray = sorted(unpack(fmt, buf[-pageheader.slotcnt * 2:]))
+        rowoffsetarray = reversed(unpack(fmt, buf[-pageheader.slotcnt * 2:]))
         rowoffsetarray = list(filter(lambda x: x != 0, rowoffsetarray))
         return rowoffsetarray
 
@@ -132,6 +138,7 @@ class MSSQLRecovery():
         self.systemschemesmap = defaultdict(list)
         self.userschemesmap = defaultdict(list)
         self.tablelist = []
+        self.of = None
         
 
     def scanPages(self):
@@ -167,7 +174,7 @@ class MSSQLRecovery():
                 if pageheader.flagbits & 0x100:
                     self._tornbits(buf)
 
-                rowoffsetarray = self.mssql.getRowOffsetArray(buf, pageheader)
+                rowoffsetarray = sorted(self.mssql.getRowOffsetArray(buf, pageheader))
 
                 for offset in rowoffsetarray:
                     tboID = unpack('<I', buf[offset + 0x4 : offset + 0x8])[0]
@@ -229,7 +236,7 @@ class MSSQLRecovery():
             if pageheader.flagbits & 0x100:
                 self._tornbits(buf)
 
-            rowoffsetarray = self.mssql.getRowOffsetArray(buf, pageheader)
+            rowoffsetarray = sorted(self.mssql.getRowOffsetArray(buf, pageheader))
 
             recordlen = rowoffsetarray[1:] + [self.mssql.pagesize - len(rowoffsetarray) * 2]
             for offset, length in zip(rowoffsetarray, recordlen):
@@ -260,7 +267,7 @@ class MSSQLRecovery():
                 if pageheader.flagbits & 0x100:
                     self._tornbits(buf)
 
-                rowoffsetarray = self.mssql.getRowOffsetArray(buf, pageheader)
+                rowoffsetarray = sorted(self.mssql.getRowOffsetArray(buf, pageheader))
 
                 for offset in rowoffsetarray:
                     tboId = unpack('<I', buf[offset + 0x04:offset + 0x08])[0]
@@ -324,7 +331,7 @@ class MSSQLRecovery():
                 if pageheader.flagbits & 0x100:
                     self._tornbits(buf)
 
-                rowoffsetarray = self.mssql.getRowOffsetArray(buf, pageheader)
+                rowoffsetarray = sorted(self.mssql.getRowOffsetArray(buf, pageheader))
 
                 recordlen = rowoffsetarray[1:] + [self.mssql.pagesize - len(rowoffsetarray) * 2]
                 for offset, length in zip(rowoffsetarray, recordlen):
@@ -370,7 +377,7 @@ class MSSQLRecovery():
                 if pageheader.flagbits & 0x100:
                     self._tornbits(buf)
 
-                rowoffsetarray = self.mssql.getRowOffsetArray(buf, pageheader)
+                rowoffsetarray = sorted(self.mssql.getRowOffsetArray(buf, pageheader))
 
                 recordlen = rowoffsetarray[1:] + [self.mssql.pagesize - len(rowoffsetarray) * 2]
                 for offset, length in zip(rowoffsetarray, recordlen):
@@ -388,11 +395,11 @@ class MSSQLRecovery():
         print('Recovery MSSQL')
 
         for tableinfo in self.tablelist:
-            if tableinfo.tablename != "image":
-                continue
             table_scheme = self.userschemesmap[tableinfo.tobjectid]
             table_scheme = sorted(table_scheme, key=lambda SchemeInfo: SchemeInfo.colorder)
-            
+
+            self.of = open(tableinfo.tablename + ".sql", 'w')
+
             create_query = 'create table ' + tableinfo.tablename
             colinfo = []
             rowinfo = RowInfo()
@@ -421,8 +428,8 @@ class MSSQLRecovery():
                 else:
                     colinfo.append(schema.colname + ' ' + schema.datatype)
 
-            create_query = create_query + '(' + ','.join(colinfo) + ')'
-            print(create_query)
+            create_query = create_query + '(' + ','.join(colinfo) + ')\n'
+            self.of.write(create_query)
             # run query
             table_page = defaultdict(list, {k: v for k, v in self.pages.items() if v == tableinfo.pobjectid})
 
@@ -437,7 +444,7 @@ class MSSQLRecovery():
 
                 print('Carving... PageID : ' + str(k) + ', Table : ' + tableinfo.tablename)
                 
-                rowoffsetarray = self.mssql.getRowOffsetArray(buf, pageheader)
+                rowoffsetarray = sorted(self.mssql.getRowOffsetArray(buf, pageheader))
 
                 startOffsetOfRowOffsetArray = self.mssql.pagesize - len(rowoffsetarray) * 2
 
@@ -447,7 +454,7 @@ class MSSQLRecovery():
                 if len(rowoffsetarray) == 0: # all record data is unallocated
                     self._scanForUnallocatedArea(buf, 0x60, self.mssql.pagesize - 0x60, rowinfo, tableinfo.tablename, table_scheme)
 
-                if rowoffsetarray[0] != 0x60: # 1st area
+                if len(rowoffsetarray) != 0 and rowoffsetarray[0] != 0x60: # 1st area
                     self._scanForUnallocatedArea(buf, 0x60, rowoffsetarray[0] - 0x60, rowinfo, tableinfo.tablename, table_scheme)
 
                 for cur, nxt in zip(rowoffsetarray, nextoffsetarray): # 2nd and 3rd area
@@ -456,6 +463,9 @@ class MSSQLRecovery():
                         continue
 
                     self._scanForUnallocatedArea(buf, cur + recordLen, nxt - (cur + recordLen), rowinfo, tableinfo.tablename, table_scheme)
+
+            self.of.close()
+        
 
     def _getTypeName(self, xtype, utype):
         if xtype == 0x7F:
@@ -819,7 +829,7 @@ class MSSQLRecovery():
             if pageheader.flagbits & 0x100:
                 self._tornbits(buf)
 
-            rowoffsetarray = self.mssql.getRowOffsetArray(buf, pageheader)
+            rowoffsetarray = sorted(self.mssql.getRowOffsetArray(buf, pageheader))
 
             recordlen = rowoffsetarray[1:] + [self.mssql.pagesize - len(rowoffsetarray) * 2]
             for offset, length in zip(rowoffsetarray, recordlen):
@@ -952,13 +962,14 @@ class MSSQLRecovery():
 
         while recordsLen < lenofunalloc:
             # 복구
+            print("** Recovery from offset : " + str(currentoffset))
             recordLen = self._calcRecordLen(buf[currentoffset + recordsLen:], rowinfo) # 복구 대상 레코드 길이
             if recordsLen + recordLen > lenofunalloc or recordLen == 0:
                 break
             query = self._parseUnallocatedRecord(buf[currentoffset + recordsLen:], recordLen, rowinfo, schemlist)
 
-            query = "insert into " + tablename + " values (" + query + ")"
-            print(query)
+            query = "insert into " + tablename + " values (" + query + ")\n"
+            self.of.write(query)
             recordsLen += recordLen
 
         return True
@@ -1036,55 +1047,187 @@ class MSSQLRecovery():
             output = str(unpack('<H', buff)[0])
         elif schema.datatype == "int":
             output = "'" + str(unpack('<I', buff)[0]) + "'"
-        elif schema.datatype == "bigint": # datetime, smalldatetime, date, time
+        elif schema.datatype == "bigint":
             output = str(unpack('<Q', buff)[0])
         elif schema.datatype == "real":
             output = str(unpack('<f', buff)[0])
         elif schema.datatype == "float":
             output = str(unpack('<d', buff)[0])
+        elif schema.datatype in ("datetime", "smalldatetime", "money", "smallmoney"):
+            output = "cast(0x" + binascii.b2a_hex(bytes(reversed(buff))).decode('utf8') + " as " + schema.datatype + ")"
+        elif schema.datatype == "date":
+            output = "cast(0x" + binascii.b2a_hex(buff).decode('utf8') + " as date)"
+        elif "time" in schema.datatype:
+            output = "cast(0x%02x" % schema.precisionoftime + binascii.b2a_hex(buff).decode('utf8') + " as time)"
+        elif "numeric" in schema.datatype or "decimal" in schema.datatype:
+            output = "convert(" + schema.datatype + ",0x%02x%02x0001" % (schema.precisionofnumeric, schema.scaleofnumeric) + \
+                binascii.b2a_hex(buff[1:]).decode('utf8') + ")"
         elif schema.datatype == "char":
             output = "'" + buff.decode('utf8') + "'"
         elif schema.datatype == "varchar":
             if isLob: # Large object
-                output = "'" + self._reconstructLOBData(buff).decode('utf8') + "'"
+                output = "'" + self._parseLobRecord(buff).decode('utf8') + "'"
             else:
                 output = "'" + buff.decode('utf8') + "'"
         elif schema.datatype == "nchar":
-            output = "'" + buff.decode('utf16') + "'" # xml, text, ntext, image, numeric, decimal, money, smallmoney
+            output = "'" + buff.decode('utf16') + "'" # xml, text, ntext, image
         elif schema.datatype == "nvarchar":
             if isLob: # Large object
-                output = "'" + self._reconstructLOBData(buff).decode('utf16') + "'"
+                output = "'" + self._parseLobRecord(buff).decode('utf16') + "'"
             else:
-                output = "'" + buff.decode('utf16') + "'" # binary, varbinary, hierarchyid, geometry, geography, uniqueidentifier, sql_variant
+                output = "'" + buff.decode('utf16') + "'" # hierarchyid, geometry, geography, uniqueidentifier, sql_variant
+        elif schema.datatype == "binary":
+            output = '0x' + (binascii.b2a_hex(buff)).decode('utf8')
+        elif schema.datatype == "varbinary":
+            if isLob: # 8bytes => lob header (type(2 byptes) / level(1 byte) / unused(1 byte) / updateseq(4 bytes))              
+                output = '0x' + (binascii.b2a_hex(self._parseLobRecord(buff))).decode('utf8')
+            else:
+                output = '0x' + (binascii.b2a_hex(buff)).decode('utf8')
+        elif schema.datatype in ("text", "ntext", "image"):
+            lobpos = set()
+            byte_output = b''
+            timestamp = unpack('<I', buff[0:4])[0]
+            pageId = unpack('<I', buff[0x08:0x0C])[0]
+            fileId = unpack('<H', buff[0x0C:0x0E])[0]
+            slotNumber = unpack('<H', buff[0x0E:0x10])[0]
+            rowid = RowId(fileId, pageId, slotNumber)
+            self._reconstructLOBData(0, rowid, timestamp, lobpos)
+
+            lobpos = sorted(lobpos)
+            for _, rowid, row_offset in lobpos:
+                lob_buf = self.mssql.read(rowid.pageId * self.mssql.pagesize, self.mssql.pagesize)
+                pageheader = self.mssql.getPageHeader(lob_buf)
+
+                if pageheader.flagbits & 0x100:
+                    self._tornbits(lob_buf)
+                if lob_buf[1] == 0x03 or lob_buf[1] == 0x04:
+                    recordLen = unpack('<H', lob_buf[row_offset + 0x02:row_offset + 0x04])[0]
+                    byte_output += lob_buf[row_offset + 0x0E:row_offset + recordLen]
+
+            if schema.datatype == "text":
+                output = "'" + byte_output.decode('utf8') + "'"
+            elif schema.datatype == "ntext":
+                output = "'" + byte_output.decode('utf16') + "'"
+            else:
+                output = '0x' + (binascii.b2a_hex(byte_output)).decode('utf8')
 
         return output
 
-    def _reconstructLOBData(self, buf):
-        # row-overflow
-        lob_pos = []
+    def _parseLobRecord(self, buff):
+        byte_output = b''
         lobinfo = LobInfo()
-        lobinfo.length = unpack('<I', buf[0x0C:0x10])[0]
-        lobinfo.pageId = unpack('<I', buf[0x10:0x14])[0]
-        lobinfo.fileId = unpack('<H', buf[0x14:0x16])[0]
-        lobinfo.slotNumber = unpack('<H', buf[0x16:0x18])[0]
-        lobinfo.timestamp = buf[0x06:0x0A]
-        lob_pos.append(lobinfo)
+        lobinfo.timestamp = unpack('<I', buff[0x06:0x0A])[0]
+        offset = 0x0C
+        while offset < len(buff):
+            lobpos = set()
+            length = unpack('<I', buff[offset:offset + 0x04])[0]
+            pageId = unpack('<I', buff[offset + 0x04:offset + 0x08])[0]
+            fileId = unpack('<H', buff[offset + 0x08:offset + 0x0A])[0]
+            slotNumber = unpack('<H', buff[offset + 0x0A:offset + 0x0C])[0]
+            rowid = RowId(fileId, pageId, slotNumber)
+            if buff[0] & 0x02 != 0:
+                self._reconstructLOBData(length, rowid, lobinfo.timestamp, lobpos, 0, length)
+            else:
+                self._reconstructLOBData(length, rowid, lobinfo.timestamp, lobpos)
+            offset += 0x0C
 
-        output = b''
-        for pos in lob_pos:
-            lob_buf = self.mssql.read(pos.pageId * self.mssql.pagesize, self.mssql.pagesize)
-            pageheader = self.mssql.getPageHeader(lob_buf)
+            lobpos = sorted(lobpos)
+            for _, rowid, row_offset in lobpos:
+                lob_buf = self.mssql.read(rowid.pageId * self.mssql.pagesize, self.mssql.pagesize)
+                pageheader = self.mssql.getPageHeader(lob_buf)
 
-            if pageheader.flagbits & 0x100:
-                self._tornbits(lob_buf)
-            if lob_buf[1] == 0x03 or lob_buf[1] == 0x04:
-                rowoffsetarray = self.mssql.getRowOffsetArray(lob_buf, pageheader)
-                for offset in rowoffsetarray:
-                    recordLen = unpack('<H', lob_buf[offset + 0x02:offset+0x04])[0]
-                    timestamp = lob_buf[offset + 0x04:offset + 0x08]
-                    lob_type = unpack('<H', lob_buf[offset + 0x0C:offset + 0x0E])[0]
-                    if pos.timestamp == timestamp:
-                        output += lob_buf[offset + 0x0E:offset + recordLen]
+                if pageheader.flagbits & 0x100:
+                    self._tornbits(lob_buf)
+                if lob_buf[1] == 0x03 or lob_buf[1] == 0x04:
+                    recordLen = unpack('<H', lob_buf[row_offset + 0x02:row_offset + 0x04])[0]
+                    byte_output += lob_buf[row_offset + 0x0E:row_offset + recordLen]
 
-        return output
+        return byte_output
+
+    def _reconstructLOBData(self, length, rowid, timestamp, lobpos, offset=0, size=0):
+        # row-overflow
+        lob_buf = self.mssql.read(rowid.pageId * self.mssql.pagesize, self.mssql.pagesize)
+        pageheader = self.mssql.getPageHeader(lob_buf)
+
+        if pageheader.flagbits & 0x100:
+            self._tornbits(lob_buf)
+        if lob_buf[1] == 0x03 or lob_buf[1] == 0x04:
+            rowoffsetarray = self.mssql.getRowOffsetArray(lob_buf, pageheader)
+            if len(rowoffsetarray) > rowid.slotNumber:
+                row_offset = rowoffsetarray[rowid.slotNumber]
+            elif len(rowoffsetarray) != 0:
+                row_offset = rowoffsetarray[0]
+            else:
+                row_offset = 0x60
+            
+            recordLen = unpack('<H', lob_buf[row_offset + 0x02:row_offset+0x04])[0]
+            blob_timestamp = unpack('<I', lob_buf[row_offset + 0x04:row_offset + 0x08])[0]
+            lob_type = unpack('<H', lob_buf[row_offset + 0x0C:row_offset + 0x0E])[0]
+            if blob_timestamp == timestamp: # allocated data
+                if lob_type == 0:
+                    pass
+                elif lob_type == 2: # internal
+                    maxlinks = unpack('<H', lob_buf[row_offset + 0x0E:row_offset + 0x10])[0]
+                    curlinks = unpack('<H', lob_buf[row_offset + 0x10:row_offset + 0x12])[0]
+                    level = unpack('<H', lob_buf[row_offset + 0x12:row_offset + 0x14])[0]
+                    link = 0
+                    prv_offset = 0
+                    while link < curlinks:
+                        blob_offset = unpack('<I', lob_buf[row_offset + 0x14 + 0x10 * link:row_offset + 0x14 + 0x10 * link + 0x04])[0]
+                        pageId = unpack('<I', lob_buf[row_offset + 0x14 + 0x10 * link + 0x08:row_offset + 0x14 + 0x10 * link + 0x0C])[0]
+                        fileId = unpack('<H', lob_buf[row_offset + 0x14 + 0x10 * link + 0x0C:row_offset + 0x14 + 0x10 * link + 0x0E])[0]
+                        slotNumber = unpack('<H', lob_buf[row_offset + 0x14 + 0x10 * link + 0x0E:row_offset + 0x14 + 0x10 * link + 0x10])[0]
+                        blob_rowid = RowId(fileId, pageId, slotNumber)
+                        self._reconstructLOBData(length, blob_rowid, timestamp, lobpos, blob_offset, blob_offset - prv_offset)
+                        prv_offset = blob_offset
+                        link += 1
+                elif lob_type == 3: # data
+                    lobpos.add((offset, rowid, row_offset))
+                elif lob_type == 5:
+                    maxlinks = unpack('<H', lob_buf[row_offset + 0x0E:row_offset + 0x10])[0]
+                    curlinks = unpack('<H', lob_buf[row_offset + 0x10:row_offset + 0x12])[0]
+                    level = unpack('<H', lob_buf[row_offset + 0x12:row_offset + 0x14])[0]
+                    link = 0
+                    prv_offset = 0
+                    while link < curlinks:
+                        blob_offset = unpack('<I', lob_buf[row_offset + 0x18 + 0x0C * link:row_offset + 0x18 + 0x0C * link + 0x04])[0]
+                        pageId = unpack('<I', lob_buf[row_offset + 0x18 + 0x0C * link + 0x04:row_offset + 0x18 + 0x0C * link + 0x08])[0]
+                        fileId = unpack('<H', lob_buf[row_offset + 0x18 + 0x0C * link + 0x08:row_offset + 0x18 + 0x0C * link + 0x0A])[0]
+                        slotNumber = unpack('<H', lob_buf[row_offset + 0x18 + 0x0C * link + 0x0A:row_offset + 0x18 + 0x0C * link + 0x0C])[0]
+                        blob_rowid = RowId(fileId, pageId, slotNumber)
+                        self._reconstructLOBData(length, blob_rowid, timestamp, lobpos, blob_offset, blob_offset - prv_offset)
+                        prv_offset = blob_offset
+                        link += 1
+            else: # unallocated data                
+                row_offset = 0x60
+                while row_offset < self.mssql.pagesize:
+                    recordLen = unpack('<H', lob_buf[row_offset + 0x02:row_offset + 0x04])[0]
+                    blob_timestamp = unpack('<I', lob_buf[row_offset + 0x04:row_offset + 0x08])[0]
+                    lob_type = unpack('<H', lob_buf[row_offset + 0x0C:row_offset + 0x0E])[0]
+                    if blob_timestamp != timestamp:
+                        row_offset += recordLen
+                        continue
+                    if recordLen - 0xE != 0:
+                        if lob_type == 0 or lob_type == 3:
+                            lobpos.add((offset, rowid, row_offset))
+                        elif lob_type == 5:
+                            maxlinks = unpack('<H', lob_buf[row_offset + 0x0E:row_offset + 0x10])[0]
+                            curlinks = unpack('<H', lob_buf[row_offset + 0x10:row_offset + 0x12])[0]
+                            level = unpack('<H', lob_buf[row_offset + 0x12:row_offset + 0x14])[0]
+                            link = 0
+                            prv_offset = 0
+                            while link < curlinks:
+                                blob_offset = unpack('<I', lob_buf[row_offset + 0x18 + 0x0C * link:row_offset + 0x18 + 0x0C * link + 0x04])[0]
+                                pageId = unpack('<I', lob_buf[row_offset + 0x18 + 0x0C * link + 0x04:row_offset + 0x18 + 0x0C * link + 0x08])[0]
+                                fileId = unpack('<H', lob_buf[row_offset + 0x18 + 0x0C * link + 0x08:row_offset + 0x18 + 0x0C * link + 0x0A])[0]
+                                slotNumber = unpack('<H', lob_buf[row_offset + 0x18 + 0x0C * link + 0x0A:row_offset + 0x18 + 0x0C * link + 0x0C])[0]
+                                blob_rowid = RowId(fileId, pageId, slotNumber)
+                                self._reconstructLOBData(length, blob_rowid, timestamp, lobpos, blob_offset, blob_offset - prv_offset)
+                                prv_offset = blob_offset
+                                link += 1
+                        break
+                    else:
+                        row_offset += recordLen
+
+        return True
     

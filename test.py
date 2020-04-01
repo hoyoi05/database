@@ -10,7 +10,7 @@ def main():
     mssql_class.read(0, 512)
     mssql_recovery = MSSQLRecovery(mssql_class)
     #### Meta data parsing
-    mssql_recovery.scanPages()
+    mssql_recovery.scanPages(sys.argv[1])
     mssql_recovery.getSystemTableColumnInfo()
     if mssql_recovery.getTableInfo() != True:
         sys.exit()

@@ -3,6 +3,7 @@ import os
 import argparse
 import enum
 import math
+import json
 import binascii
 
 from ctypes import *
@@ -141,24 +142,30 @@ class MSSQLRecovery():
         self.of = None
         
 
-    def scanPages(self):
+    def scanPages(self, filename):
         print('MDF Page Scan')
         pagenumber = 0
+        jsonFilename = os.path.splitext(filename)[0] + '.json'
 
-        while True:
-            buf = self.mssql.read(self.mssql.pagesize * pagenumber, self.mssql.pagesize)
-            if not buf:
-                return
-            
-            if buf[0x01] != 0x01:
+        if os.path.isfile(jsonFilename):
+            pages = json.load(open(jsonFilename))
+            for pagenumber, objectid in pages.items():
+                self.pages[int(pagenumber)] = objectid                
+        else:
+            while True:
+                buf = self.mssql.read(self.mssql.pagesize * pagenumber, self.mssql.pagesize)
+                if not buf:
+                    return
+                
+                if buf[0x01] != 0x01:
+                    pagenumber += 1
+                    continue
+
+                pageheader = self.mssql.getPageHeader(buf)
+                self.pages[pagenumber] = pageheader.objectid
                 pagenumber += 1
-                continue
 
-            pageheader = self.mssql.getPageHeader(buf)
-            self.pages[pagenumber] = pageheader.objectid
-            pagenumber += 1
-
-            del buf
+                del buf
 
     def getSystemTableColumnInfo(self):
         print('Get System Table Column Information')
@@ -434,6 +441,9 @@ class MSSQLRecovery():
             table_page = defaultdict(list, {k: v for k, v in self.pages.items() if v == tableinfo.pobjectid})
 
             for k, v in table_page.items():
+                if k == 3276283:
+                    a = 0
+
                 buf = self.mssql.read(k * self.mssql.pagesize, self.mssql.pagesize)
                 pageheader = self.mssql.getPageHeader(buf)
                 if pageheader.type != 0x01:
@@ -458,11 +468,17 @@ class MSSQLRecovery():
                     self._scanForUnallocatedArea(buf, 0x60, rowoffsetarray[0] - 0x60, rowinfo, tableinfo.tablename, table_scheme)
 
                 for cur, nxt in zip(rowoffsetarray, nextoffsetarray): # 2nd and 3rd area
-                    recordLen = self._calcRecordLen(buf[cur:], rowinfo)
+                    recordLen, isAlive = self._calcRecordLen(buf[cur:], rowinfo)
+                    if isAlive:
+                        currentoffset = cur + recordLen
+                        lenofunalloc = nxt - (cur + recordLen)
+                    else:
+                        currentoffset = cur
+                        lenofunalloc = nxt - cur
                     if cur + recordLen == nxt:
                         continue
 
-                    self._scanForUnallocatedArea(buf, cur + recordLen, nxt - (cur + recordLen), rowinfo, tableinfo.tablename, table_scheme)
+                    self._scanForUnallocatedArea(buf, currentoffset, lenofunalloc, rowinfo, tableinfo.tablename, table_scheme)
 
             self.of.close()
         
@@ -926,14 +942,19 @@ class MSSQLRecovery():
 
     def _calcRecordLen(self, buf, rowinfo):
         # record idetification exception code is needed
+        isAlive = True
         if buf[0] != 0x10 and buf[0] != 0x30 and buf[0] != 0x3c and buf[0] != 0x1c:
-            return 0
+            return 0, isAlive
+        
+        if buf[0] & 0x0C == 0x0C:
+            isAlive = False
+
         offsetOftotalNumOfCol = unpack('<H', buf[0x2:0x4])[0]
 
         totalNumOfCol = unpack('<H', buf[offsetOftotalNumOfCol:offsetOftotalNumOfCol + 2])[0]
 
         if totalNumOfCol != rowinfo.numoftotalcol:
-            return 0
+            return 0, isAlive
 
 
         lenOfNullBitmap = math.ceil(rowinfo.numoftotalcol/8)
@@ -945,14 +966,14 @@ class MSSQLRecovery():
         recordLen += (2 + lenOfNullBitmap)
 
         if (rowinfo.numofvariablecol == 0 or buf[0] == 0x10 or buf[0] == 0x1c):
-            return recordLen
+            return recordLen, isAlive
         else:
             numOfVariableCol = unpack('<H', buf[recordLen:recordLen + 2])[0]
             recordLen = unpack('<H', buf[recordLen + numOfVariableCol * 2:recordLen + (numOfVariableCol + 1) * 2])[0]
             if recordLen > 0x8000:
                 recordLen -= 0x8000
 
-            return recordLen
+            return recordLen, isAlive
                 
     def _scanForUnallocatedArea(self, buf, currentoffset, lenofunalloc, rowinfo, tablename, schemlist):
         if currentoffset + lenofunalloc > self.mssql.pagesize:
@@ -963,7 +984,7 @@ class MSSQLRecovery():
         while recordsLen < lenofunalloc:
             # 복구
             print("** Recovery from offset : " + str(currentoffset))
-            recordLen = self._calcRecordLen(buf[currentoffset + recordsLen:], rowinfo) # 복구 대상 레코드 길이
+            recordLen, _ = self._calcRecordLen(buf[currentoffset + recordsLen:], rowinfo) # 복구 대상 레코드 길이
             if recordsLen + recordLen > lenofunalloc or recordLen == 0:
                 break
             query = self._parseUnallocatedRecord(buf[currentoffset + recordsLen:], recordLen, rowinfo, schemlist)

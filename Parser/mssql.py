@@ -145,7 +145,7 @@ class MSSQLRecovery():
     def scanPages(self, filename):
         print('MDF Page Scan')
         pagenumber = 0
-        jsonFilename = os.path.splitext(filename)[0] + '.json'
+        jsonFilename = os.path.abspath(os.path.splitext(filename)[0] + '.json')
 
         if os.path.isfile(jsonFilename):
             pages = json.load(open(jsonFilename))
@@ -155,7 +155,7 @@ class MSSQLRecovery():
             while True:
                 buf = self.mssql.read(self.mssql.pagesize * pagenumber, self.mssql.pagesize)
                 if not buf:
-                    return
+                    break
                 
                 if buf[0x01] != 0x01:
                     pagenumber += 1
@@ -166,6 +166,8 @@ class MSSQLRecovery():
                 pagenumber += 1
 
                 del buf
+
+            json.dump(self.pages, open(jsonFilename, 'w'))
 
     def getSystemTableColumnInfo(self):
         print('Get System Table Column Information')
@@ -1226,8 +1228,11 @@ class MSSQLRecovery():
                     blob_timestamp = unpack('<I', lob_buf[row_offset + 0x04:row_offset + 0x08])[0]
                     lob_type = unpack('<H', lob_buf[row_offset + 0x0C:row_offset + 0x0E])[0]
                     if blob_timestamp != timestamp:
-                        row_offset += recordLen
-                        continue
+                        if recordLen != 0:
+                            row_offset += recordLen
+                            continue
+                        else:
+                            break
                     if recordLen - 0xE != 0:
                         if lob_type == 0 or lob_type == 3:
                             lobpos.add((offset, rowid, row_offset))
@@ -1248,7 +1253,10 @@ class MSSQLRecovery():
                                 link += 1
                         break
                     else:
-                        row_offset += recordLen
+                        if recordLen != 0:
+                            row_offset += recordLen
+                        else:
+                            break
 
         return True
     
